@@ -25,7 +25,7 @@ import torch
 import torch.distributed
 import torch.nn.functional as F
 from megatron.core import parallel_state, tensor_parallel
-from megatron.core.datasets.utils import compile_helpers
+from megatron.core.datasets.utils import compile_helpers_distributed
 from megatron.core.fusions.fused_bias_dropout import bias_dropout_add_fused_train
 from megatron.core.fusions.fused_bias_gelu import bias_gelu
 from megatron.core.fusions.fused_bias_swiglu import bias_swiglu
@@ -58,6 +58,23 @@ from megatron.bridge.utils.common_utils import (
     get_rank_safe,
     get_world_size_safe,
 )
+
+
+def _compile_dataset_helpers() -> None:
+    """Ensure the dataset helper extension is loaded in every distributed process."""
+
+    rank = torch.distributed.get_rank()
+    start_time = time.time()
+    if rank == 0:
+        print("> compiling dataset index builder ...")
+    compile_helpers_distributed()
+    if rank == 0:
+        print(
+            ">>> done with dataset index builder. Compilation time: {:.3f} seconds".format(
+                time.time() - start_time
+            ),
+            flush=True,
+        )
 
 
 def initialize_megatron(
@@ -138,20 +155,13 @@ def initialize_megatron(
         use_inprocess_restart=use_inprocess_restart,
     )
 
-    # Compile dataset helpers after distributed initialization
-    # Use local rank to ensure each node compiles independently (multi-node without shared filesystem)
+    # Compile and import the dataset helpers in every process after distributed initialization.
+    # The MCore helper uses a node-local cache plus a file lock, so concurrent ranks share one
+    # actual build while still registering the extension in each process. Its failure all-reduce
+    # also replaces the old one-sided rank-zero build followed by a barrier, which could strand
+    # peer ranks when the compiler failed.
     if torch.distributed.is_initialized():
-        if get_local_rank_preinit() == 0:
-            start_time = time.time()
-            print("> compiling dataset index builder ...")
-            compile_helpers()
-            print(
-                ">>> done with dataset index builder. Compilation time: {:.3f} seconds".format(
-                    time.time() - start_time
-                ),
-                flush=True,
-            )
-        torch.distributed.barrier()
+        _compile_dataset_helpers()
 
     return result
 

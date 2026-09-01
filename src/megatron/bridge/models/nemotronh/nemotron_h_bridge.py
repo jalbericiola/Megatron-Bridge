@@ -33,6 +33,9 @@ from megatron.bridge.models.hf_pretrained.causal_lm import PreTrainedCausalLM
 from megatron.bridge.models.hybrid.hybrid_provider import HybridModelProvider
 
 
+_MISSING_MTP_FIELD = object()
+
+
 def _replace_wildcards(pattern: str, captures: Tuple[str, ...]) -> str:
     """Replace ** then * sequentially with captures."""
     out = pattern
@@ -271,18 +274,100 @@ class NemotronHBridge(MegatronModelBridge):
     ADDITIONAL_FILE_PATTERNS = ["*reasoning_parser.py"]
 
     @staticmethod
-    def _hf_mtp_config(hf_config) -> tuple[int, Optional[str]]:
-        """Return the normalized MTP depth and block pattern from an HF config."""
-        mtp_num_layers = int(getattr(hf_config, "num_nextn_predict_layers", 0) or 0)
-        if mtp_num_layers < 0:
+    def _hf_mtp_config(hf_config) -> tuple[int, Optional[str], int, bool]:
+        """Normalize physical and logical MTP semantics from an HF config.
+
+        Old Megatron-Bridge exports only wrote ``num_nextn_predict_layers`` and
+        used it as the repeated predictor's logical depth. Native Nemotron-H
+        configs use the same field as a physical block count. Values above one
+        are therefore ambiguous unless the new execution-semantics fields are
+        present. Refuse that case instead of constructing randomly initialized
+        physical predictors for weights that an old export never contained.
+        """
+        physical_mtp_blocks = int(getattr(hf_config, "num_nextn_predict_layers", 0) or 0)
+        if physical_mtp_blocks < 0:
             raise ValueError("num_nextn_predict_layers must be non-negative.")
-        if mtp_num_layers == 0:
-            return 0, None
+
+        configured_speculative_steps = getattr(
+            hf_config,
+            "mtp_num_speculative_steps",
+            _MISSING_MTP_FIELD,
+        )
+        configured_repeated_layer = getattr(
+            hf_config,
+            "mtp_use_repeated_layer",
+            _MISSING_MTP_FIELD,
+        )
+        fields_are_missing = (
+            configured_speculative_steps is _MISSING_MTP_FIELD,
+            configured_repeated_layer is _MISSING_MTP_FIELD,
+        )
+        if fields_are_missing[0] != fields_are_missing[1]:
+            raise ValueError(
+                "mtp_num_speculative_steps and mtp_use_repeated_layer must be "
+                "defined together."
+            )
+
+        if all(fields_are_missing):
+            if physical_mtp_blocks > 1:
+                raise ValueError(
+                    "Ambiguous legacy Nemotron-H MTP config: "
+                    f"num_nextn_predict_layers={physical_mtp_blocks}, but "
+                    "mtp_num_speculative_steps and mtp_use_repeated_layer are absent. "
+                    "Old Megatron-Bridge exports used num_nextn_predict_layers as "
+                    "a repeated logical depth, while native checkpoints use it as a "
+                    "physical block count. For an old repeated export, set "
+                    "num_nextn_predict_layers=1, mtp_num_speculative_steps to the "
+                    "old depth, and mtp_use_repeated_layer=true. For a native "
+                    "multi-block checkpoint, preserve num_nextn_predict_layers, set "
+                    "mtp_num_speculative_steps to the same value, and set "
+                    "mtp_use_repeated_layer=false. Do not initialize ambiguous "
+                    "additional predictor blocks from random weights."
+                )
+            # The old default was repeated MTP. At depth one, repeated and
+            # non-repeated execution have the same single physical block and
+            # one forward application, so this compatibility inference is safe.
+            mtp_num_speculative_steps = physical_mtp_blocks
+            mtp_use_repeated_layer = bool(physical_mtp_blocks)
+        else:
+            if configured_speculative_steps is None or configured_repeated_layer is None:
+                raise ValueError(
+                    "mtp_num_speculative_steps and mtp_use_repeated_layer must not be null."
+                )
+            mtp_num_speculative_steps = int(configured_speculative_steps)
+            if not isinstance(configured_repeated_layer, bool):
+                raise ValueError("mtp_use_repeated_layer must be a boolean.")
+            mtp_use_repeated_layer = configured_repeated_layer
+
+        if mtp_num_speculative_steps < 0:
+            raise ValueError("mtp_num_speculative_steps must be non-negative.")
+        if not physical_mtp_blocks and mtp_num_speculative_steps:
+            raise ValueError(
+                "mtp_num_speculative_steps requires at least one physical next-token predictor."
+            )
+        if physical_mtp_blocks and not mtp_num_speculative_steps:
+            raise ValueError(
+                "A physical next-token predictor requires at least one speculative step."
+            )
+        if mtp_use_repeated_layer and physical_mtp_blocks != 1:
+            raise ValueError(
+                "Repeated Nemotron-H MTP requires exactly one physical next-token predictor."
+            )
+        if not mtp_use_repeated_layer and mtp_num_speculative_steps != physical_mtp_blocks:
+            raise ValueError(
+                "Non-repeated Nemotron-H MTP requires mtp_num_speculative_steps to match "
+                "num_nextn_predict_layers."
+            )
 
         mtp_pattern = getattr(hf_config, "mtp_hybrid_override_pattern", None)
-        if not mtp_pattern:
+        if physical_mtp_blocks and not mtp_pattern:
             raise ValueError("An HF config with num_nextn_predict_layers > 0 must define mtp_hybrid_override_pattern.")
-        return mtp_num_layers, mtp_pattern
+        return (
+            physical_mtp_blocks,
+            mtp_pattern if physical_mtp_blocks else None,
+            mtp_num_speculative_steps,
+            mtp_use_repeated_layer,
+        )
 
     def provider_bridge(self, hf_pretrained: PreTrainedCausalLM) -> HybridModelProvider:
         """Convert HuggingFace Nemotron-H config to HybridModelProvider."""
@@ -321,12 +406,22 @@ class NemotronHBridge(MegatronModelBridge):
             provider.moe_latent_size = hf_config.moe_latent_size
         if hasattr(hf_config, "moe_shared_expert_overlap"):
             provider.moe_shared_expert_overlap = hf_config.moe_shared_expert_overlap
-        mtp_num_layers, mtp_pattern = self._hf_mtp_config(hf_config)
-        provider.mtp_num_layers = mtp_num_layers
+        (
+            physical_mtp_blocks,
+            mtp_pattern,
+            mtp_num_speculative_steps,
+            mtp_use_repeated_layer,
+        ) = self._hf_mtp_config(hf_config)
+
+        provider.mtp_num_layers = (
+            mtp_num_speculative_steps if mtp_use_repeated_layer else physical_mtp_blocks
+        )
         provider.mtp_hybrid_override_pattern = mtp_pattern
-        provider.mtp_use_repeated_layer = bool(mtp_num_layers and getattr(hf_config, "mtp_use_repeated_layer", True))
-        provider.keep_mtp_spec_in_bf16 = bool(mtp_num_layers and getattr(hf_config, "keep_mtp_spec_in_bf16", True))
-        if mtp_num_layers:
+        provider.mtp_use_repeated_layer = mtp_use_repeated_layer
+        provider.keep_mtp_spec_in_bf16 = bool(
+            physical_mtp_blocks and getattr(hf_config, "keep_mtp_spec_in_bf16", True)
+        )
+        if provider.mtp_num_layers:
             provider.mtp_loss_scaling_factor = getattr(hf_config, "mtp_loss_scaling_factor", 0.3)
 
         return provider
@@ -383,9 +478,28 @@ class NemotronHBridge(MegatronModelBridge):
         # Mamba: conv_kernel, time_step_*, mamba_hidden_act, etc.
         # MoE: n_shared_experts, norm_topk_prob
 
+        # Nemotron-H's native ``num_nextn_predict_layers`` counts physical predictor
+        # blocks. MCore's ``mtp_num_layers`` instead counts logical prediction depths
+        # when one block is replayed with ``mtp_use_repeated_layer``. Preserve both
+        # values explicitly so a one-physical/five-depth flagship model exports one native block,
+        # not five fake outer blocks, while non-repeated models remain one-to-one.
+        mtp_num_speculative_steps = int(getattr(provider, "mtp_num_layers", 0) or 0)
+        if mtp_num_speculative_steps < 0:
+            raise ValueError("mtp_num_layers must be non-negative.")
+        mtp_use_repeated_layer = bool(
+            mtp_num_speculative_steps and getattr(provider, "mtp_use_repeated_layer", False)
+        )
+        physical_mtp_blocks = 1 if mtp_use_repeated_layer else mtp_num_speculative_steps
+        hf_cfg["num_nextn_predict_layers"] = physical_mtp_blocks
+        hf_cfg["mtp_num_speculative_steps"] = mtp_num_speculative_steps
+        hf_cfg["mtp_use_repeated_layer"] = mtp_use_repeated_layer
+        # The generic bridge emits this alternative MTP field as well. Nemotron-H
+        # has one canonical physical-count field; retaining a logical value here
+        # would leave vLLM with contradictory architecture metadata.
+        hf_cfg.pop("mtp_num_hidden_layers", None)
+
         # Megatron uses None="not set/disabled", but HF modeling code expects integers
         # and will crash on None (e.g. n_routed_experts // n_group → TypeError)
-        hf_cfg["num_nextn_predict_layers"] = hf_cfg.get("num_nextn_predict_layers") or 0
         hf_cfg["n_group"] = hf_cfg.get("n_group") or 1
         hf_cfg["topk_group"] = hf_cfg.get("topk_group") or 1
 
@@ -395,7 +509,7 @@ class NemotronHBridge(MegatronModelBridge):
         # Return MegatronMappingRegistry containing parameter mappings from Megatron to HF format
         # First create simple 1:1 parameter mappings using a dictionary for readability
 
-        _, mtp_pattern = self._hf_mtp_config(self.hf_config)
+        _, mtp_pattern, _, _ = self._hf_mtp_config(self.hf_config)
         mtp_layers_per_block = len(mtp_pattern) if mtp_pattern else 0
 
         # Dictionary maps Megatron parameter names -> HF parameter names
@@ -482,6 +596,10 @@ class NemotronHBridge(MegatronModelBridge):
                 "mtp.layers.*.mtp_model_layer.layers.*.mixer.in_proj.layer_norm_weight": "mtp.layers.*.norm.weight",
                 "mtp.layers.*.mtp_model_layer.layers.*.mlp.linear_fc1.layer_norm_weight": "mtp.layers.*.norm.weight",
                 "mtp.layers.*.mtp_model_layer.layers.*.self_attention.linear_qkv.layer_norm_weight": "mtp.layers.*.norm.weight",
+                # Standalone norm aliases used when the fused TE LayerNormLinear
+                # modules are replaced by separate normalization modules.
+                "mtp.layers.*.mtp_model_layer.layers.*.norm.weight": "mtp.layers.*.norm.weight",
+                "mtp.layers.*.mtp_model_layer.layers.*.input_layernorm.weight": "mtp.layers.*.norm.weight",
                 "mtp.layers.*.mtp_model_layer.layers.*.mlp.router.weight": "mtp.layers.*.mixer.gate.weight",
                 "mtp.layers.*.mtp_model_layer.layers.*.mlp.router.expert_bias": "mtp.layers.*.mixer.gate.e_score_correction_bias",
                 # GroupedMLP (moe_grouped_gemm=True): expert weights are stored as weight0, weight1, ...

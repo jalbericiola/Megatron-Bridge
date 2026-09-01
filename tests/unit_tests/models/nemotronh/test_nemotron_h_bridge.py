@@ -343,7 +343,9 @@ class TestNemotronHBridge:
         mtp_config_dict = {
             **active_nemotronh_config_dict,
             "n_routed_experts": 0,
-            "num_nextn_predict_layers": 2,
+            "num_nextn_predict_layers": 1,
+            "mtp_num_speculative_steps": 2,
+            "mtp_use_repeated_layer": True,
             "mtp_hybrid_override_pattern": "*E",
             "keep_mtp_spec_in_bf16": True,
         }
@@ -364,6 +366,135 @@ class TestNemotronHBridge:
         assert result.mtp_use_repeated_layer is True
         assert result.keep_mtp_spec_in_bf16 is True
         assert result.mtp_loss_scaling_factor == 0.3
+
+    def test_provider_bridge_rejects_replaying_multiple_physical_predictors(
+        self, active_nemotronh_config_dict
+    ):
+        mock_pretrained = Mock(spec=PreTrainedCausalLM)
+        mock_pretrained.config = SimpleNamespace(
+            **{
+                **active_nemotronh_config_dict,
+                "n_routed_experts": 0,
+                "num_nextn_predict_layers": 2,
+                "mtp_num_speculative_steps": 5,
+                "mtp_use_repeated_layer": True,
+                "mtp_hybrid_override_pattern": "*E",
+            }
+        )
+
+        with pytest.raises(ValueError, match="exactly one physical"):
+            NemotronHBridge().provider_bridge(mock_pretrained)
+
+    def test_provider_bridge_restores_repeated_mtp_execution_depth(
+        self, active_nemotronh_config_dict
+    ):
+        """One native predictor can be replayed for five logical prediction depths."""
+        mock_pretrained = Mock(spec=PreTrainedCausalLM)
+        mock_pretrained.config = SimpleNamespace(
+            **{
+                **active_nemotronh_config_dict,
+                "n_routed_experts": 0,
+                "num_nextn_predict_layers": 1,
+                "mtp_num_speculative_steps": 5,
+                "mtp_use_repeated_layer": True,
+                "mtp_hybrid_override_pattern": "*E",
+            }
+        )
+
+        result = NemotronHBridge().provider_bridge(mock_pretrained)
+
+        assert result.mtp_num_layers == 5
+        assert result.mtp_use_repeated_layer is True
+        assert result.mtp_hybrid_override_pattern == "*E"
+
+    def test_provider_bridge_rejects_ambiguous_legacy_multi_depth_mtp(
+        self, active_nemotronh_config_dict
+    ):
+        """An old export cannot identify repeated depth versus physical blocks."""
+        mock_pretrained = Mock(spec=PreTrainedCausalLM)
+        mock_pretrained.config = SimpleNamespace(
+            **{
+                **active_nemotronh_config_dict,
+                "n_routed_experts": 0,
+                "num_nextn_predict_layers": 5,
+                "mtp_hybrid_override_pattern": "*E",
+            }
+        )
+
+        with pytest.raises(ValueError, match="Ambiguous legacy Nemotron-H MTP config") as exc_info:
+            NemotronHBridge().provider_bridge(mock_pretrained)
+
+        message = str(exc_info.value)
+        assert "num_nextn_predict_layers=1" in message
+        assert "mtp_use_repeated_layer=true" in message
+        assert "mtp_use_repeated_layer=false" in message
+
+    def test_provider_bridge_accepts_explicit_independent_physical_mtp_blocks(
+        self, active_nemotronh_config_dict
+    ):
+        """Explicit new metadata distinguishes a genuine two-block checkpoint."""
+        mock_pretrained = Mock(spec=PreTrainedCausalLM)
+        mock_pretrained.config = SimpleNamespace(
+            **{
+                **active_nemotronh_config_dict,
+                "n_routed_experts": 0,
+                "num_nextn_predict_layers": 2,
+                "mtp_num_speculative_steps": 2,
+                "mtp_use_repeated_layer": False,
+                "mtp_hybrid_override_pattern": "*E",
+            }
+        )
+
+        result = NemotronHBridge().provider_bridge(mock_pretrained)
+
+        assert result.mtp_num_layers == 2
+        assert result.mtp_use_repeated_layer is False
+        assert result.mtp_hybrid_override_pattern == "*E"
+
+    def test_provider_bridge_preserves_unambiguous_legacy_single_depth_mtp(
+        self, active_nemotronh_config_dict
+    ):
+        """One old-style predictor has identical repeated/non-repeated behavior."""
+        mock_pretrained = Mock(spec=PreTrainedCausalLM)
+        mock_pretrained.config = SimpleNamespace(
+            **{
+                **active_nemotronh_config_dict,
+                "n_routed_experts": 0,
+                "num_nextn_predict_layers": 1,
+                "mtp_hybrid_override_pattern": "*E",
+            }
+        )
+
+        result = NemotronHBridge().provider_bridge(mock_pretrained)
+
+        assert result.mtp_num_layers == 1
+        assert result.mtp_use_repeated_layer is True
+
+    @pytest.mark.parametrize(
+        "partial_semantics",
+        [
+            {"mtp_num_speculative_steps": 2},
+            {"mtp_use_repeated_layer": False},
+        ],
+    )
+    def test_provider_bridge_rejects_partial_mtp_execution_semantics(
+        self,
+        active_nemotronh_config_dict,
+        partial_semantics,
+    ):
+        mock_pretrained = Mock(spec=PreTrainedCausalLM)
+        mock_pretrained.config = SimpleNamespace(
+            **{
+                **active_nemotronh_config_dict,
+                "n_routed_experts": 0,
+                "num_nextn_predict_layers": 2,
+                "mtp_hybrid_override_pattern": "*E",
+                **partial_semantics,
+            }
+        )
+
+        with pytest.raises(ValueError, match="must be defined together"):
+            NemotronHBridge().provider_bridge(mock_pretrained)
 
     @pytest.mark.parametrize("num_nextn_predict_layers", [None, 0])
     def test_provider_bridge_disables_mtp_naturally(
@@ -551,10 +682,11 @@ class TestNemotronHBridgeMegatronToHFConfig:
         assert hf_cfg["num_nextn_predict_layers"] == 1
 
     def test_megatron_to_hf_config_keeps_repeated_identical_mtp_pattern_separate(self):
-        """Collapse repeated unified MTP blocks to the HF MTP block pattern field."""
+        """Non-repeated MTP preserves one physical HF block per MCore outer block."""
         provider = SimpleNamespace(
             hybrid_layer_pattern="MEME/*E/*E",
             mtp_num_layers=2,
+            mtp_use_repeated_layer=False,
         )
 
         hf_cfg = NemotronHBridge.megatron_to_hf_config(provider)
@@ -562,6 +694,25 @@ class TestNemotronHBridgeMegatronToHFConfig:
         assert hf_cfg["hybrid_override_pattern"] == "MEME"
         assert hf_cfg["mtp_hybrid_override_pattern"] == "*E"
         assert hf_cfg["num_nextn_predict_layers"] == 2
+        assert hf_cfg["mtp_num_speculative_steps"] == 2
+        assert hf_cfg["mtp_use_repeated_layer"] is False
+
+    def test_megatron_to_hf_config_exports_one_physical_repeated_predictor(self):
+        """Five logical depths reuse one physical Nemotron-H predictor block."""
+        provider = SimpleNamespace(
+            hybrid_layer_pattern="MEME/*E/*E/*E/*E/*E",
+            mtp_num_layers=5,
+            mtp_use_repeated_layer=True,
+        )
+
+        hf_cfg = NemotronHBridge.megatron_to_hf_config(provider)
+
+        assert hf_cfg["hybrid_override_pattern"] == "MEME"
+        assert hf_cfg["mtp_hybrid_override_pattern"] == "*E"
+        assert hf_cfg["num_nextn_predict_layers"] == 1
+        assert hf_cfg["mtp_num_speculative_steps"] == 5
+        assert hf_cfg["mtp_use_repeated_layer"] is True
+        assert "mtp_num_hidden_layers" not in hf_cfg
 
     def test_megatron_to_hf_config_rejects_unknown_main_pattern_characters(self):
         """Preserve validation for unknown main hybrid_override_pattern characters."""
@@ -1076,6 +1227,17 @@ class TestNemotronHBridgeMTPIntegration:
         qkv_mappings = [m for m in registry.mappings if isinstance(m, _MTPFlatteningQKVMapping)]
         assert len(qkv_mappings) == 1
 
+    def test_mapping_registry_rejects_ambiguous_legacy_multi_depth_mtp(self):
+        """Direct registry construction cannot bypass the import-time guard."""
+        bridge = NemotronHBridge()
+        bridge.hf_config = SimpleNamespace(
+            num_nextn_predict_layers=5,
+            mtp_hybrid_override_pattern="*E",
+        )
+
+        with pytest.raises(ValueError, match="Ambiguous legacy Nemotron-H MTP config"):
+            bridge.mapping_registry()
+
     def test_mapping_registry_resolves_representative_mtp_params(self):
         """Verify current MTP mappings resolve to concrete HF parameter names."""
         bridge = NemotronHBridge()
@@ -1094,6 +1256,59 @@ class TestNemotronHBridgeMTPIntegration:
         assert mlp_mapping.hf_param == "mtp.layers.2.mixer.experts.5.up_proj.weight"
         assert isinstance(qkv_mapping, QKVMapping)
         assert qkv_mapping.hf_param["q"] == "mtp.layers.3.mixer.q_proj.weight"
+
+    def test_mapping_registry_resolves_standalone_mtp_norm_aliases_without_warnings(self, capsys):
+        """Separate Mamba and attention norms retain flattened MTP indices."""
+        bridge = NemotronHBridge()
+        bridge.hf_config = SimpleNamespace(num_nextn_predict_layers=1, mtp_hybrid_override_pattern="M*")
+
+        registry = bridge.mapping_registry()
+
+        mamba_norm = registry.megatron_to_hf_lookup("mtp.layers.2.mtp_model_layer.layers.0.norm.weight")
+        attention_norm = registry.megatron_to_hf_lookup("mtp.layers.2.mtp_model_layer.layers.1.input_layernorm.weight")
+
+        assert isinstance(mamba_norm, AutoMapping)
+        assert mamba_norm.hf_param == "mtp.layers.4.norm.weight"
+        assert isinstance(attention_norm, AutoMapping)
+        assert attention_norm.hf_param == "mtp.layers.5.norm.weight"
+        assert "Unrecognized mapping type" not in capsys.readouterr().out
+
+    def test_repeated_flagship_maps_one_mcore_outer_to_native_hf_layers(self):
+        """The repeated *E predictor exports only native flattened layers 0 and 1."""
+        provider = SimpleNamespace(
+            hybrid_layer_pattern="M/*E/*E/*E/*E/*E",
+            mtp_num_layers=5,
+            mtp_use_repeated_layer=True,
+        )
+        hf_cfg = NemotronHBridge.megatron_to_hf_config(provider)
+        bridge = NemotronHBridge()
+        bridge.hf_config = SimpleNamespace(**hf_cfg)
+        registry = bridge.mapping_registry()
+
+        eh_proj = registry.megatron_to_hf_lookup("mtp.layers.0.eh_proj.weight")
+        qkv = registry.megatron_to_hf_lookup(
+            "mtp.layers.0.mtp_model_layer.layers.0.self_attention.linear_qkv.weight"
+        )
+        expert = registry.megatron_to_hf_lookup(
+            "mtp.layers.0.mtp_model_layer.layers.1.mlp.experts.linear_fc1.weight5"
+        )
+        final_norm = registry.megatron_to_hf_lookup(
+            "mtp.layers.0.final_layernorm.weight"
+        )
+
+        assert isinstance(eh_proj, AutoMapping)
+        assert eh_proj.hf_param == "mtp.layers.0.eh_proj.weight"
+        assert isinstance(qkv, QKVMapping)
+        assert qkv.hf_param == {
+            "q": "mtp.layers.0.mixer.q_proj.weight",
+            "k": "mtp.layers.0.mixer.k_proj.weight",
+            "v": "mtp.layers.0.mixer.v_proj.weight",
+        }
+        assert isinstance(expert, AutoMapping)
+        assert expert.hf_param == "mtp.layers.1.mixer.experts.5.up_proj.weight"
+        assert isinstance(final_norm, AutoMapping)
+        assert final_norm.hf_param == "mtp.layers.1.final_layernorm.weight"
+        assert hf_cfg["num_nextn_predict_layers"] == 1
 
     def test_quantized_mtp_amax_mappings_preserve_flattened_layer_indices(self):
         bridge = NemotronHBridge()
