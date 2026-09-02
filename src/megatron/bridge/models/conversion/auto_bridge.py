@@ -17,7 +17,7 @@ from __future__ import annotations
 import dataclasses
 import logging
 import os
-from collections.abc import Callable
+from collections.abc import Callable, Mapping
 from contextlib import nullcontext
 from functools import cached_property, partial
 from pathlib import Path
@@ -289,6 +289,63 @@ def _drop_readonly_config_properties(
     return {key: value for key, value in config_dict.items() if key not in readonly_properties}
 
 
+def _bridge_export_only_config_fields(
+    model_bridge: MegatronModelBridge,
+    exported_config: dict[str, object],
+) -> dict[str, object]:
+    """Validate and copy bridge-declared fields that may be new to an HF reference.
+
+    The normal config projection intentionally drops unknown keys. A model-family bridge may
+    preserve a narrowly declared scalar when dropping it would change checkpoint execution
+    semantics. This extension is fail-closed: the declaration must be a key-to-exact-type mapping,
+    and each generated value must be present with that exact type. A newer reference may already
+    own the key, but its default must not override the checkpoint-derived generated value.
+    """
+    declarations = getattr(type(model_bridge), "HF_CONFIG_EXPORT_ONLY_FIELDS", {})
+    if not isinstance(declarations, Mapping):
+        raise TypeError("HF_CONFIG_EXPORT_ONLY_FIELDS must be a mapping of field names to types")
+
+    preserved = {}
+    for key, expected_type in declarations.items():
+        if type(key) is not str or not key.isidentifier():
+            raise TypeError("HF_CONFIG_EXPORT_ONLY_FIELDS keys must be non-empty Python identifiers")
+        if not isinstance(expected_type, type):
+            raise TypeError(f"HF_CONFIG_EXPORT_ONLY_FIELDS[{key!r}] must declare an exact value type")
+        if key not in exported_config:
+            raise ValueError(f"bridge declared export-only HF config field {key!r} but did not export it")
+        value = exported_config[key]
+        if type(value) is not expected_type:
+            raise TypeError(
+                f"bridge export-only HF config field {key!r} must have exact type "
+                f"{expected_type.__name__}, got {type(value).__name__}"
+            )
+        preserved[key] = value
+    return preserved
+
+
+def _bridge_export_excluded_config_fields(
+    model_bridge: MegatronModelBridge,
+    exported_config: dict[str, object],
+    *,
+    export_only_fields: Mapping[str, object],
+) -> frozenset[str]:
+    """Validate bridge-declared legacy aliases that reference projection must not restore."""
+    declarations = getattr(type(model_bridge), "HF_CONFIG_EXPORT_EXCLUDED_FIELDS", frozenset())
+    if type(declarations) is not frozenset:
+        raise TypeError("HF_CONFIG_EXPORT_EXCLUDED_FIELDS must be a frozenset of field names")
+
+    excluded = set()
+    for key in declarations:
+        if type(key) is not str or not key.isidentifier():
+            raise TypeError("HF_CONFIG_EXPORT_EXCLUDED_FIELDS entries must be non-empty Python identifiers")
+        if key in export_only_fields:
+            raise ValueError(f"HF config field {key!r} cannot be both export-only and export-excluded")
+        if key in exported_config:
+            raise ValueError(f"bridge export-excluded HF config field {key!r} was still exported")
+        excluded.add(key)
+    return frozenset(excluded)
+
+
 class AutoBridge(Generic[MegatronModelT]):
     """
     Automatically select and instantiate the appropriate bridge for a model.
@@ -468,10 +525,43 @@ class AutoBridge(Generic[MegatronModelT]):
         # 2. Translate Megatron config -> HF, conforming to reference config
         bridge = cls.from_hf_config(hf_cfg)
         megatron_hf_cfg_dict = bridge._model_bridge.megatron_to_hf_config(megatron_cfg)
-        megatron_hf_cfg_dict = conform_config_to_reference(megatron_hf_cfg_dict, hf_cfg.to_dict())
+        reference_hf_cfg_dict = hf_cfg.to_dict()
+        export_only_fields = _bridge_export_only_config_fields(
+            bridge._model_bridge,
+            megatron_hf_cfg_dict,
+        )
+        export_excluded_fields = _bridge_export_excluded_config_fields(
+            bridge._model_bridge,
+            megatron_hf_cfg_dict,
+            export_only_fields=export_only_fields,
+        )
+        megatron_hf_cfg_dict = conform_config_to_reference(dict(megatron_hf_cfg_dict), reference_hf_cfg_dict)
+        for key, value in export_only_fields.items():
+            projected_value = megatron_hf_cfg_dict.get(key, _MISSING)
+            if projected_value is not _MISSING and (
+                type(projected_value) is not type(value) or projected_value != value
+            ):
+                raise ValueError(f"reference projection changed bridge export-only HF config field {key!r}")
+            megatron_hf_cfg_dict[key] = value
+        for key in export_excluded_fields:
+            megatron_hf_cfg_dict.pop(key, None)
         megatron_hf_cfg_dict = _drop_readonly_config_properties(megatron_hf_cfg_dict, type(hf_cfg))
         # 3. Build final bridge from the synthesized config
         synthesized_config = type(hf_cfg)(**megatron_hf_cfg_dict)
+        if export_only_fields or export_excluded_fields:
+            serialized_config = synthesized_config.to_dict()
+            if not isinstance(serialized_config, Mapping):
+                raise TypeError("synthesized HF config to_dict() must return a mapping")
+            for key, value in export_only_fields.items():
+                synthesized_value = getattr(synthesized_config, key, _MISSING)
+                if type(synthesized_value) is not type(value) or synthesized_value != value:
+                    raise ValueError(f"synthesized HF config did not preserve bridge export-only field {key!r}")
+                serialized_value = serialized_config.get(key, _MISSING)
+                if type(serialized_value) is not type(value) or serialized_value != value:
+                    raise ValueError(f"serialized HF config did not preserve bridge export-only field {key!r}")
+            for key in export_excluded_fields:
+                if key in serialized_config:
+                    raise ValueError(f"serialized HF config restored bridge export-excluded field {key!r}")
         synthesized_config.name_or_path = hf_model_id
         bridge = cls.from_hf_config(synthesized_config)
         bridge.hf_model_id = hf_model_id

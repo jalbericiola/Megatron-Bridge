@@ -39,6 +39,8 @@ from transformers.configuration_utils import PretrainedConfig
 
 from megatron.bridge.models.conversion.auto_bridge import (
     AutoBridge,
+    _bridge_export_excluded_config_fields,
+    _bridge_export_only_config_fields,
     _config_disables_mtp,
     _drop_readonly_config_properties,
     _model_omits_mtp,
@@ -1093,6 +1095,133 @@ class TestAutoBridge:
         mock_load_cfg.assert_called_once_with(str(ckpt_dir))
         mock_conform.assert_called_once_with({"vocab_size": 64000}, {"vocab_size": 32000})
         assert mock_from_config.call_args_list[1].args[0].name_or_path == hf_model_id
+
+    @pytest.mark.parametrize(
+        ("declarations", "exported", "error", "match"),
+        [
+            ((), {"logical_depth": 5}, TypeError, "must be a mapping"),
+            ({"not-a-field": int}, {"not-a-field": 5}, TypeError, "Python identifiers"),
+            ({"logical_depth": "int"}, {"logical_depth": 5}, TypeError, "exact value type"),
+            ({"logical_depth": int}, {}, ValueError, "did not export it"),
+            ({"logical_depth": int}, {"logical_depth": True}, TypeError, "got bool"),
+        ],
+    )
+    def test_export_only_config_field_declarations_fail_closed(
+        self,
+        declarations,
+        exported,
+        error,
+        match,
+    ):
+        class DeclaredBridge:
+            HF_CONFIG_EXPORT_ONLY_FIELDS = declarations
+
+        with pytest.raises(error, match=match):
+            _bridge_export_only_config_fields(DeclaredBridge(), exported)
+
+    @pytest.mark.parametrize(
+        ("declarations", "exported", "export_only", "error", "match"),
+        [
+            (set(), {}, {}, TypeError, "must be a frozenset"),
+            (frozenset({"not-a-field"}), {}, {}, TypeError, "Python identifiers"),
+            (
+                frozenset({"legacy_depth"}),
+                {},
+                {"legacy_depth": 5},
+                ValueError,
+                "both export-only and export-excluded",
+            ),
+            (
+                frozenset({"legacy_depth"}),
+                {"legacy_depth": 5},
+                {},
+                ValueError,
+                "was still exported",
+            ),
+        ],
+    )
+    def test_export_excluded_config_field_declarations_fail_closed(
+        self,
+        declarations,
+        exported,
+        export_only,
+        error,
+        match,
+    ):
+        class DeclaredBridge:
+            HF_CONFIG_EXPORT_EXCLUDED_FIELDS = declarations
+
+        with pytest.raises(error, match=match):
+            _bridge_export_excluded_config_fields(
+                DeclaredBridge(),
+                exported,
+                export_only_fields=export_only,
+            )
+
+    @pytest.mark.parametrize(
+        "reference_metadata",
+        [
+            {},
+            {
+                "logical_depth": 1,
+                "uses_repeated_block": False,
+                "legacy_depth": 99,
+            },
+        ],
+        ids=["old-reference-omits-fields", "future-reference-has-stale-fields"],
+    )
+    def test_from_auto_config_preserves_declared_fields_through_real_projection(
+        self,
+        tmp_path,
+        reference_metadata,
+    ):
+        """The real reference projection keeps checkpoint-derived declared metadata."""
+        checkpoint = tmp_path / "ckpt"
+        checkpoint.mkdir()
+        (checkpoint / "run_config.yaml").write_text("dummy: true\n")
+
+        class DeclaredBridge:
+            HF_CONFIG_EXPORT_ONLY_FIELDS = {
+                "logical_depth": int,
+                "uses_repeated_block": bool,
+            }
+            HF_CONFIG_EXPORT_EXCLUDED_FIELDS = frozenset({"legacy_depth"})
+
+            @staticmethod
+            def megatron_to_hf_config(_megatron_config):
+                return {
+                    "vocab_size": 64000,
+                    "logical_depth": 5,
+                    "uses_repeated_block": True,
+                }
+
+        reference = PretrainedConfig(vocab_size=32000, **reference_metadata)
+        first_bridge = Mock()
+        first_bridge._model_bridge = DeclaredBridge()
+        second_bridge = Mock()
+
+        with (
+            patch("transformers.AutoConfig.from_pretrained", return_value=reference),
+            patch(
+                "megatron.bridge.training.model_load_save.load_model_config",
+                return_value=(Mock(name="megatron_cfg"), None),
+            ),
+            patch.object(
+                AutoBridge,
+                "from_hf_config",
+                side_effect=[first_bridge, second_bridge],
+            ) as mock_from_config,
+        ):
+            result = AutoBridge.from_auto_config(str(checkpoint), "reference/model")
+
+        synthesized = mock_from_config.call_args_list[1].args[0]
+        assert result is second_bridge
+        assert synthesized.vocab_size == 64000
+        assert synthesized.logical_depth == 5
+        assert synthesized.uses_repeated_block is True
+        assert synthesized.to_dict()["logical_depth"] == 5
+        assert synthesized.to_dict()["uses_repeated_block"] is True
+        assert "legacy_depth" not in synthesized.to_dict()
 
     def test_from_auto_config_uses_latest_iter_run_config(self, tmp_path):
         """from_auto_config falls back to latest iter_* directory for run_config.yaml."""

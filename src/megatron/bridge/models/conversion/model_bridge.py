@@ -443,6 +443,20 @@ class MegatronModelBridge(
     # for example ``["*reasoning_parser.py"]``.
     ADDITIONAL_FILE_PATTERNS = None
 
+    # Top-level HF config fields synthesized by this bridge that may be absent from an older
+    # reference config. AutoBridge normally projects onto the reference schema; subclasses may
+    # declare an exact field-to-type allowlist here when dropping new execution metadata would make
+    # the exported checkpoint ambiguous or incorrect. Declared fields are preserved fail-closed:
+    # missing values, non-exact value types, and projection changes are rejected. A newer reference
+    # may already own a declared key; the checkpoint-derived value remains authoritative.
+    HF_CONFIG_EXPORT_ONLY_FIELDS: ClassVar[Mapping[str, type]] = {}
+
+    # Top-level legacy aliases this bridge deliberately omits from synthesized HF configs. The
+    # generic reference projection fills missing reference-owned keys, so model-family bridges
+    # must declare an exact immutable denylist when restoring such an alias would conflict with
+    # canonical metadata. AutoBridge validates the declaration and verifies serialized absence.
+    HF_CONFIG_EXPORT_EXCLUDED_FIELDS: ClassVar[frozenset[str]] = frozenset()
+
     # HuggingFace PretrainedConfig, set by register_bridge_implementation dispatch.
     # Available in mapping_registry(), stream_weights_*(), and build_conversion_tasks().
     hf_config = None
