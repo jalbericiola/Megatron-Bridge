@@ -16,6 +16,7 @@ import os
 import tempfile
 import warnings
 from pathlib import Path
+from types import SimpleNamespace
 from unittest.mock import Mock, patch
 
 import pytest
@@ -28,6 +29,7 @@ from megatron.bridge.training.config import DistributedInitConfig
 from megatron.bridge.training.initialize import (
     _initialize_tp_communicators,
     _setup_flight_recorder_env,
+    initialize_megatron,
     set_jit_fusion_options,
 )
 
@@ -64,6 +66,70 @@ def test_set_jit_fusion_options_preserves_builder_config_for_warmup() -> None:
         set_jit_fusion_options(model_config, micro_batch_size=1)
 
     warmup_jit_function.assert_called_once_with(model_config, 1)
+
+
+def _minimal_initialize_config() -> SimpleNamespace:
+    """Return only the config fields consumed before the dataset-helper branch."""
+    return SimpleNamespace(
+        model=object(),
+        dist=object(),
+        rng=object(),
+        rerun_state_machine=object(),
+        train=SimpleNamespace(
+            rampup_batch_size=None,
+            global_batch_size=1,
+            micro_batch_size=1,
+            decrease_batch_size_if_needed=False,
+        ),
+        inprocess_restart=None,
+        profiling=None,
+        data_parallel_size=1,
+        ddp=SimpleNamespace(num_distributed_optimizer_instances=1),
+    )
+
+
+def test_initialize_megatron_compiles_dataset_helpers_and_barriers_by_default(capsys) -> None:
+    result_sentinel = object()
+    with (
+        patch("megatron.bridge.training.initialize.init_num_microbatches_calculator"),
+        patch("megatron.bridge.training.initialize.init_rerun_state"),
+        patch("megatron.bridge.training.initialize.torch_dist_init", return_value=result_sentinel),
+        patch("megatron.bridge.training.initialize.get_rank_safe", return_value=0),
+        patch("megatron.bridge.training.initialize.torch.distributed.is_initialized", return_value=True),
+        patch("megatron.bridge.training.initialize.get_local_rank_preinit", return_value=0),
+        patch("megatron.bridge.training.initialize.compile_helpers") as compile_helpers,
+        patch("megatron.bridge.training.initialize.torch.distributed.barrier") as barrier,
+    ):
+        result = initialize_megatron(_minimal_initialize_config(), allow_no_cuda=True)
+
+    assert result is result_sentinel
+    compile_helpers.assert_called_once_with()
+    barrier.assert_called_once_with()
+    assert "MEGATRON_BRIDGE_DATASET_HELPERS mode=compile" in capsys.readouterr().out
+
+
+def test_initialize_megatron_can_skip_dataset_helpers_without_barrier(capsys) -> None:
+    result_sentinel = object()
+    with (
+        patch("megatron.bridge.training.initialize.init_num_microbatches_calculator"),
+        patch("megatron.bridge.training.initialize.init_rerun_state"),
+        patch("megatron.bridge.training.initialize.torch_dist_init", return_value=result_sentinel),
+        patch("megatron.bridge.training.initialize.get_rank_safe", return_value=0),
+        patch("megatron.bridge.training.initialize.torch.distributed.is_initialized", return_value=True),
+        patch("megatron.bridge.training.initialize.get_local_rank_preinit", return_value=0),
+        patch("megatron.bridge.training.initialize.compile_helpers") as compile_helpers,
+        patch("megatron.bridge.training.initialize.torch.distributed.barrier") as barrier,
+    ):
+        result = initialize_megatron(
+            _minimal_initialize_config(),
+            allow_no_cuda=True,
+            compile_dataset_helpers=False,
+        )
+
+    assert result is result_sentinel
+    compile_helpers.assert_not_called()
+    barrier.assert_not_called()
+    assert "MEGATRON_BRIDGE_DATASET_HELPERS mode=skip reason=caller_disabled" in capsys.readouterr().out
 
 
 class TestInitializeTPCommunicators:

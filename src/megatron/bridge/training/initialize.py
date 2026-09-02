@@ -67,6 +67,7 @@ def initialize_megatron(
     get_embedding_ranks: Optional[Callable[[list[int], Optional[int]], list[int]]] = None,
     get_position_embedding_ranks: Optional[Callable[[list[int], Optional[int]], list[int]]] = None,
     restart_store: Optional[torch.distributed.Store] = None,
+    compile_dataset_helpers: bool = True,
 ) -> Callable[[], None] | ProcessGroupCollection | None:
     """Initialize Megatron core components and distributed setup.
 
@@ -80,6 +81,9 @@ def initialize_megatron(
         get_embedding_ranks: Optional function to determine embedding layer ranks.
         get_position_embedding_ranks: Optional function to determine position embedding ranks.
         restart_store: Optional store for in-process restart.
+        compile_dataset_helpers: Whether to compile Megatron Core's indexed-dataset helper.
+            Callers that never construct indexed Megatron datasets may disable this so immutable
+            source deployments do not need a compiler or a writable package directory.
 
     Returns:
         An optional callable to finish MPU initialization if lazy_mpu_init is True,
@@ -138,20 +142,29 @@ def initialize_megatron(
         use_inprocess_restart=use_inprocess_restart,
     )
 
-    # Compile dataset helpers after distributed initialization
-    # Use local rank to ensure each node compiles independently (multi-node without shared filesystem)
+    # Compile dataset helpers after distributed initialization. Use local rank to ensure each node
+    # compiles independently (multi-node without shared filesystem). All ranks take the same branch;
+    # when compilation is disabled, omit its matching barrier as well.
     if torch.distributed.is_initialized():
-        if get_local_rank_preinit() == 0:
-            start_time = time.time()
-            print("> compiling dataset index builder ...")
-            compile_helpers()
+        local_rank = get_local_rank_preinit()
+        if compile_dataset_helpers:
+            if local_rank == 0:
+                print("MEGATRON_BRIDGE_DATASET_HELPERS mode=compile", flush=True)
+                start_time = time.time()
+                print("> compiling dataset index builder ...")
+                compile_helpers()
+                print(
+                    ">>> done with dataset index builder. Compilation time: {:.3f} seconds".format(
+                        time.time() - start_time
+                    ),
+                    flush=True,
+                )
+            torch.distributed.barrier()
+        elif local_rank == 0:
             print(
-                ">>> done with dataset index builder. Compilation time: {:.3f} seconds".format(
-                    time.time() - start_time
-                ),
+                "MEGATRON_BRIDGE_DATASET_HELPERS mode=skip reason=caller_disabled",
                 flush=True,
             )
-        torch.distributed.barrier()
 
     return result
 
